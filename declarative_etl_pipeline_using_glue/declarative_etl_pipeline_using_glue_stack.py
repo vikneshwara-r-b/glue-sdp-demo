@@ -145,7 +145,7 @@ class DeclarativeEtlPipelineUsingGlueStack(Stack):
                 "--enable-glue-datacatalog": "true",
             },
         )
-        job.add_dependency(database)
+        job.add_resource_dependency(database)
 
         # ======================================================================
         # Tags & outputs
@@ -155,6 +155,7 @@ class DeclarativeEtlPipelineUsingGlueStack(Stack):
         Tags.of(self).add("Owner", props.owner_tag)
 
         CfnOutput(self, "BucketName", value=bucket.bucket_name)
+        CfnOutput(self, "Prefix", value=props.prefix)
         CfnOutput(self, "DatabaseName", value=props.database_name)
         CfnOutput(self, "JobName", value=props.job_name)
         CfnOutput(self, "GlueJobRoleArn", value=role.role_arn)

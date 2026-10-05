@@ -19,16 +19,26 @@ orchestrator (Step Functions/MWAA), Spark Declarative Pipelines (SDP) infers the
 dependency graph from table references in the code and runs everything as one job.
 
 Layers:
-- **bronze_orders** (`@dp.materialized_view`, Python) — raw CSV ingested as-is, all
-  columns typed as `StringType` (no coercion, no filtering).
-- **silver_orders** (`@dp.materialized_view`, Python) — reads `spark.table("bronze_orders")`,
+- **bronze_orders** (streaming table, Python — `dp.create_streaming_table()` +
+  `@dp.append_flow(target="bronze_orders")`) — raw CSV ingested incrementally via
+  `spark.readStream`, all columns typed as `StringType` (no coercion, no filtering).
+- **silver_orders** (streaming table, Python — `dp.create_streaming_table()` +
+  `@dp.append_flow(target="silver_orders")`) — reads `spark.readStream.table("bronze_orders")`,
   casts types, filters to `status == COMPLETE` and `amount > 0`, derives an
   `amount_band` column (`large` ≥500, `medium` ≥100, else `small`).
 - **gold_sales_summary** (SQL materialized view) — aggregates `silver_orders` by
-  `region` (order_count, total_sales, average_order_value).
+  `region` (order_count, total_sales, average_order_value). Stays a materialized view:
+  it's an aggregation/report, exactly the case the docs say MVs are for.
 
 SDP resolves bronze → silver → gold ordering automatically from these table references;
-we never write a DAG.
+we never write a DAG. Bronze and silver are streaming tables (not materialized views) so
+each run processes only new data since the last checkpoint — per AWS's SDP docs
+(https://docs.aws.amazon.com/glue/latest/dg/spark-declarative-pipelines.html), this needs
+their checkpoint/`_spark_metadata` state to persist in S3, which is already satisfied by
+the Glue database's `LocationUri` (see item 3 below) — no extra CDK change required.
+`dp.create_streaming_table()` + `@dp.append_flow(target=...)` is the Python API Glue's
+docs specify for streaming tables; do not use a bare `@dp.table` decorator instead — it
+is not the documented/supported syntax for this product.
 
 Two independent runtime controls (set via `--conf` job arguments, not CDK-managed
 resources, but the CDK code must make it easy to pass them at `start-job-run` time):
@@ -84,9 +94,15 @@ resources, but the CDK code must make it easy to pass them at `start-job-run` ti
      file-content substitution. Glue job arguments do NOT reach them (SDP runs them via
      its own CLI wrapper, so `sys.argv` has no `--BUCKET`/`--PREFIX`; `getResolvedOptions`
      fails). Instead the rendered `spark-pipeline.yml` carries a `configuration:` entry
-     `orders.input.path: s3://{bucket}/{prefix}/input/orders.csv`, and `01_bronze.py`
-     reads it with `spark.conf.get("orders.input.path")`. `03_gold.sql` needs no bucket/prefix/database at all;
-     it only references the already-registered `silver_orders` table.
+     `orders.input.path: s3://{bucket}/{prefix}/input/`, and `01_bronze.py`
+     reads it with `spark.conf.get("orders.input.path")`. This must be the input
+     **directory**, not a specific file: `bronze_orders` is a streaming table reading via
+     `spark.readStream`, and Spark's file-streaming source requires `.load(path)` to
+     point at a directory it can monitor for new files — pointing it at a literal file
+     fails with `Option 'basePath' must be a directory`. `01_bronze.py` scopes the read
+     to CSVs with `.option("pathGlobFilter", "*.csv")`. `03_gold.sql` needs no
+     bucket/prefix/database at all; it only references the already-registered
+     `silver_orders` table.
    CDK must:
    - Render `pipeline_src/` into a `build/package/` directory at synth time (since the
      bucket is explicitly named per item 1, bucket/prefix/database are plain Python
@@ -114,8 +130,10 @@ resources, but the CDK code must make it easy to pass them at `start-job-run` ti
    `aws s3 cp sample_data/orders.csv s3://<bucket>/<prefix>/input/orders.csv` command in
    the README as a post-deploy step the user runs themselves. `sample_data/` is
    gitignored (see `.gitignore`) — it's local sample content, not committed source.
-7. **Outputs** — CfnOutput for bucket name, database name, job name, role ARN, so the
-   user can immediately run `aws glue start-job-run` for validate/run steps.
+7. **Outputs** — CfnOutput for bucket name, prefix, database name, job name, role ARN,
+   so the user can immediately run `aws glue start-job-run` for validate/run steps. The
+   `Prefix` output lets `scripts/deploy.sh --upload` read back the actually-deployed
+   prefix instead of hardcoding it, so it can't drift from a `-c prefix=...` override.
 
 ### Explicitly NOT part of the CDK stack (operational, not infra)
 - Triggering `VALIDATE` / `RUN` job runs — these are `start-job-run` CLI/SDK calls, not
@@ -195,10 +213,12 @@ resources, but the CDK code must make it easy to pass them at `start-job-run` ti
   (`spark.conf.get("orders.input.path")`, set by the manifest's `configuration:` block) —
   the files themselves are copied unchanged, never token-substituted. Do not use
   `getResolvedOptions`/`sys.argv` in transformation files: Glue job arguments don't reach them.
-- Materialized views **always fully recompute**; only streaming tables (`@dp.table`,
-  not used in this base walkthrough) support incremental refresh/checkpoints. If asked
-  to "extend" the pipeline to be incremental later, convert bronze to `@dp.table` and
-  note that its checkpoint/data must live in S3, not locally.
+- Materialized views **always fully recompute**; only streaming tables support
+  incremental refresh/checkpoints. `bronze_orders` and `silver_orders` are streaming
+  tables (`dp.create_streaming_table()` + `@dp.append_flow(target=...)`); their
+  checkpoint/`_spark_metadata` state lives in S3 via the Glue database's `LocationUri` —
+  not locally. `gold_sales_summary` stays a materialized view since it's a pure
+  aggregation/report, which the docs call out as the materialized-view use case.
 - `VALIDATE` mode does dependency/SQL/Python compilation checks and writes **no data** —
   useful as a safe post-deploy smoke test before the first real `RUN`.
 
@@ -220,6 +240,15 @@ aws glue start-job-run --job-name "$JOB_NAME" \
 # Run the pipeline for real
 aws glue start-job-run --job-name "$JOB_NAME" \
   --arguments '{"--conf":"spark.glue.sdp.jobMode=RUN"}' --region "$AWS_REGION"
+
+# Full refresh: reset every table (including streaming-table checkpoints) and
+# recompute from scratch -- a runtime job argument, no CDK/infra change involved.
+# jobMode and runMode are both `--conf` settings, so they're combined into ONE
+# `--conf` value (space-separated), not two separate JSON keys -- `--arguments` is a
+# flat map and can only hold one `--conf` entry.
+aws glue start-job-run --job-name "$JOB_NAME" \
+  --arguments '{"--conf":"spark.glue.sdp.jobMode=RUN --conf spark.glue.sdp.runMode=--full-refresh-all"}' \
+  --region "$AWS_REGION"
 
 # Inspect materialized tables
 aws glue get-tables --database-name "$DATABASE" --region "$AWS_REGION" \
