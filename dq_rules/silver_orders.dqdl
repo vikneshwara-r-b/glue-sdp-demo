@@ -1,0 +1,10 @@
+Rules = [
+    RowCount > 0,
+    Completeness "order_id" >= 1.0,
+    Uniqueness "order_id" = 1.0,
+    Completeness "customer_id" >= 0.99,
+    IsComplete "order_ts",
+    ColumnValues "status" in ["COMPLETE"],
+    ColumnValues "amount" > 0,
+    ColumnValues "amount_band" in ["large","medium","small"]
+]

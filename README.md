@@ -17,9 +17,9 @@ Deployed with the [AWS CDK](https://aws.amazon.com/cdk/) (Python).
 ## What it deploys
 
 - **Amazon S3 bucket** — private, SSE-S3 encrypted, versioned, TLS-enforced. Holds the
-  pipeline's input CSV, SDP state, and Data Catalog warehouse location. (The packaged
-  pipeline zip itself is uploaded to the CDK bootstrap assets bucket via
-  `aws_s3_assets.Asset`, not this bucket.)
+  pipeline's input CSV, SDP state, Data Catalog warehouse location, and DQ results
+  under `dq-results/`. (The packaged pipeline zip itself is uploaded to the CDK
+  bootstrap assets bucket via `aws_s3_assets.Asset`, not this bucket.)
 - **One AWS Glue 6.0 job** with Spark Declarative Pipelines enabled
   (`--enable-spark-declarative-pipeline`) and Data Catalog registration
   (`--enable-glue-datacatalog`), running with the Flex execution class (cheaper spare
@@ -28,7 +28,10 @@ Deployed with the [AWS CDK](https://aws.amazon.com/cdk/) (Python).
   tables into it but does not create it, so CDK must.
 - **One IAM role** for Glue to assume, scoped to this bucket only (it also carries the
   AWS-managed `AWSGlueServiceRole` policy that Glue itself requires — see "Security"
-  below).
+  below), reused as the execution role for DQ evaluation runs.
+- **Two AWS Glue Data Quality rulesets** (`silver_orders`, `gold_sales_summary`) and an
+  **EventBridge rule** that triggers both automatically when `orders-sdp-job` succeeds
+  — see "Data quality" below.
 
 ## Architecture
 
@@ -151,8 +154,10 @@ cdk synth
 cdk deploy
 ```
 
-`cdk deploy` prints `BucketName`, `Prefix`, `DatabaseName`, `JobName`, and
-`GlueJobRoleArn` as stack outputs. Load them into shell variables for the steps below:
+`cdk deploy` prints `BucketName`, `Prefix`, `DatabaseName`, `JobName`,
+`GlueJobRoleArn`, `SilverDqRulesetName`, and `GoldDqRulesetName` as stack outputs. Load
+the first four into shell variables for the steps below (the DQ ruleset names are used
+inline later, in "Data quality"):
 
 ```bash
 export AWS_REGION=<region>
@@ -288,6 +293,47 @@ aws glue get-tables --database-name "$DATABASE" --region "$AWS_REGION" \
 
 Query `bronze_orders`, `silver_orders`, and `gold_sales_summary` via Amazon Athena
 (downstream consumer concern, not provisioned by this stack).
+
+## Data quality
+
+Two [AWS Glue Data Quality](https://docs.aws.amazon.com/glue/latest/dg/data-quality-authorization.html)
+rulesets (DQDL, in [`dq_rules/`](dq_rules/)) are attached directly to `silver_orders`
+and `gold_sales_summary` — **not** run inside `orders-sdp-job` itself. An EventBridge
+rule watches for `orders-sdp-job`'s own `SUCCEEDED` event and automatically starts both
+evaluation runs right after, via a small CDK-managed Lambda
+([`AwsApi` event target](https://docs.aws.amazon.com/cdk/api/v2/python/aws_cdk.aws_events_targets/AwsApi.html))
+that calls `glue:StartDataQualityRulesetEvaluationRun` — no custom Python DQ script, no
+second Glue job. Results publish to the CloudWatch `Glue Data Quality` namespace and to
+`s3://$BUCKET/$PREFIX/dq-results/{silver,gold}/`.
+
+This is deliberately **decoupled from the pipeline job** (see CLAUDE.md section 4 for
+why a same-job approach isn't possible with `--enable-spark-declarative-pipeline`): DQ
+can never fail `orders-sdp-job`, because it isn't part of that job's execution at all.
+It also means no first-deploy bootstrapping logic is needed — the EventBridge rule
+can't fire before SDP has materialized the tables at least once.
+
+Nothing to do manually — DQ runs automatically after every successful pipeline run. To
+trigger it on demand instead (e.g. to re-check without a full pipeline run):
+
+```bash
+aws glue start-data-quality-ruleset-evaluation-run \
+  --data-source '{"GlueTable":{"DatabaseName":"'"$DATABASE"'","TableName":"silver_orders"}}' \
+  --role "$(stack_output GlueJobRoleArn)" \
+  --ruleset-names '["'"$(stack_output SilverDqRulesetName)"'"]' \
+  --region "$AWS_REGION"
+```
+
+(swap `silver_orders`/`SilverDqRulesetName` for `gold_sales_summary`/`GoldDqRulesetName`
+to check gold instead). Inspect results:
+
+```bash
+# Find the run, then its result:
+aws glue get-data-quality-ruleset-evaluation-run --run-id <run-id> --region "$AWS_REGION"
+aws glue get-data-quality-result --result-id <result-id> --region "$AWS_REGION"
+```
+
+or browse the CloudWatch `Glue Data Quality` namespace / the `dq-results/` S3 prefix
+directly.
 
 ## Tests
 

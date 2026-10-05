@@ -107,7 +107,59 @@ def test_glue_role_inline_policy_is_scoped_not_wildcard():
                 continue
             resources = resource if isinstance(resource, list) else [resource]
             for res in resources:
-                assert res != "*", "S3 inline policy resource must not be '*'"
+                if res != "*":
+                    continue
+                # Accepted exception: CloudWatch PutMetricData has no resource-level
+                # ARN support at all (AWS's own Glue Data Quality IAM docs use
+                # Resource "*" for it too) -- the namespace condition is the
+                # compensating control, same spirit as the AWSGlueServiceRole
+                # managed-policy exception documented in README's Security section.
+                actions = statement.get("Action")
+                actions = [actions] if isinstance(actions, str) else (actions or [])
+                is_cloudwatch_metrics_exception = actions == [
+                    "cloudwatch:PutMetricData"
+                ] and statement.get("Condition") == {
+                    "StringEquals": {"cloudwatch:namespace": "Glue Data Quality"}
+                }
+                assert is_cloudwatch_metrics_exception, (
+                    "inline policy resource must not be '*' except the documented "
+                    "cloudwatch:PutMetricData exception"
+                )
+
+
+def test_dq_rulesets_target_correct_tables():
+    template = _synth_template()
+    template.has_resource_properties(
+        "AWS::Glue::DataQualityRuleset",
+        {
+            "Name": "orders-sdp-job-silver-dq",
+            "TargetTable": {"TableName": "silver_orders", "DatabaseName": "sdp_demo_db"},
+        },
+    )
+    template.has_resource_properties(
+        "AWS::Glue::DataQualityRuleset",
+        {
+            "Name": "orders-sdp-job-gold-dq",
+            "TargetTable": {
+                "TableName": "gold_sales_summary",
+                "DatabaseName": "sdp_demo_db",
+            },
+        },
+    )
+
+
+def test_dq_trigger_rule_fires_only_on_job_success():
+    template = _synth_template()
+    template.has_resource_properties(
+        "AWS::Events::Rule",
+        {
+            "EventPattern": {
+                "source": ["aws.glue"],
+                "detail-type": ["Glue Job State Change"],
+                "detail": {"jobName": ["orders-sdp-job"], "state": ["SUCCEEDED"]},
+            }
+        },
+    )
 
 
 def test_glue_database_has_location_uri():

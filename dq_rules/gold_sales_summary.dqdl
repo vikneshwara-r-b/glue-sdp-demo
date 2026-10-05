@@ -1,0 +1,7 @@
+Rules = [
+    RowCount > 0,
+    Completeness "region" >= 1.0,
+    Uniqueness "region" = 1.0,
+    ColumnValues "order_count" > 0,
+    ColumnValues "total_sales" > 0
+]

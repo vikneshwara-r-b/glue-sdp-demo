@@ -131,9 +131,34 @@ resources, but the CDK code must make it easy to pass them at `start-job-run` ti
    the README as a post-deploy step the user runs themselves. `sample_data/` is
    gitignored (see `.gitignore`) — it's local sample content, not committed source.
 7. **Outputs** — CfnOutput for bucket name, prefix, database name, job name, role ARN,
-   so the user can immediately run `aws glue start-job-run` for validate/run steps. The
-   `Prefix` output lets `scripts/deploy.sh --upload` read back the actually-deployed
-   prefix instead of hardcoding it, so it can't drift from a `-c prefix=...` override.
+   DQ ruleset names, so the user can immediately run `aws glue start-job-run` for
+   validate/run steps. The `Prefix` output lets `scripts/deploy.sh --upload` read back
+   the actually-deployed prefix instead of hardcoding it, so it can't drift from a
+   `-c prefix=...` override.
+8. **Post-pipeline data quality** — two `aws_glue.CfnDataQualityRuleset` (L1), one
+   targeting `silver_orders`, one targeting `gold_sales_summary`, with DQDL rule bodies
+   in `dq_rules/*.dqdl` (read at synth time, same pattern as item 4's
+   `spark-pipeline.yml` templating — not inline Python strings in the stack). An
+   `aws_events.Rule` matches Glue's own `Glue Job State Change` event
+   (`source: aws.glue`, `detail.jobName: <job_name>`, `detail.state: SUCCEEDED`) and
+   targets `aws_events_targets.AwsApi` (service `"Glue"`, action
+   `"startDataQualityRulesetEvaluationRun"`) — **not** `CallAwsService`, which doesn't
+   exist in this `aws-cdk-lib` version; `AwsApi` is a CDK-managed singleton Lambda, not
+   a true zero-compute direct integration. Pass an explicit `policy_statement` to each
+   `AwsApi` target scoped to `dataQualityRuleset/*` — the construct's default
+   auto-derived permission would otherwise land on a broader resource. The IAM role
+   passed as `StartDataQualityRulesetEvaluationRun`'s `Role` parameter reuses the
+   existing Glue job role (already has S3 access to the bucket), extended with
+   `glue:GetDataQualityRuleset`/`GetDataQualityRulesetEvaluationRun`/
+   `PublishDataQuality`/`GetDataQualityResult` (scoped to `dataQualityRuleset/*` —
+   AWS's own minimal DQ policy examples use this exact resource-type scoping, not a
+   full `"*"`), `glue:GetTable`/`GetDatabase`/`GetPartitions` (scoped tightly to this
+   stack's catalog/database/the two target tables), and `cloudwatch:PutMetricData`
+   (`Resource: "*"` — CloudWatch's PutMetricData has no resource-level ARN support at
+   all — with a `cloudwatch:namespace = "Glue Data Quality"` condition as the
+   compensating control, the same "accepted exception" pattern as `AWSGlueServiceRole`
+   in item 2). DQ results write to the existing bucket under `<prefix>/dq-results/`, not
+   a separate bucket.
 
 ### Explicitly NOT part of the CDK stack (operational, not infra)
 - Triggering `VALIDATE` / `RUN` job runs — these are `start-job-run` CLI/SDK calls, not
@@ -221,6 +246,19 @@ resources, but the CDK code must make it easy to pass them at `start-job-run` ti
   aggregation/report, which the docs call out as the materialized-view use case.
 - `VALIDATE` mode does dependency/SQL/Python compilation checks and writes **no data** —
   useful as a safe post-deploy smoke test before the first real `RUN`.
+- **Post-pipeline DQ cannot run inside `orders-sdp-job` as a custom "wrapper" script.**
+  When `--enable-spark-declarative-pipeline=true` is set, `CfnJob.command.script_location`
+  is treated as the SDP *package* (manifest + `transformations/`), and Glue substitutes
+  its own internal `/tmp/sdp_wrapper.py` as the actual driver — nothing placed in that
+  zip gets executed as a script, confirmed directly from a `StreamingQueryException`
+  traceback during this project's development. There is also no public Python API to
+  invoke a pipeline run programmatically (verified against Apache Spark's own docs,
+  https://spark.apache.org/docs/4.1.2/declarative-pipelines-programming-guide.html —
+  only the `spark-pipelines` CLI is documented). Do not propose a `main.py` that runs
+  SDP then DQ then `job.commit()` in the same job. DQ is implemented instead as fully
+  decoupled native AWS Glue Data Quality, triggered by EventBridge on the job's own
+  `SUCCEEDED` event (item 8 in section 2) — this also means a DQ failure can never fail
+  `orders-sdp-job`, by construction, not by a try/except.
 
 ---
 
@@ -253,6 +291,13 @@ aws glue start-job-run --job-name "$JOB_NAME" \
 # Inspect materialized tables
 aws glue get-tables --database-name "$DATABASE" --region "$AWS_REGION" \
   --query 'TableList[].Name' --output table
+
+# DQ runs automatically (EventBridge, on job SUCCEEDED) -- this is only for an
+# on-demand re-check without a full pipeline run.
+aws glue start-data-quality-ruleset-evaluation-run \
+  --data-source '{"GlueTable":{"DatabaseName":"'"$DATABASE"'","TableName":"silver_orders"}}' \
+  --role "$(stack_output GlueJobRoleArn)" --ruleset-names '["orders-sdp-job-silver-dq"]' \
+  --region "$AWS_REGION"
 
 # Tear down
 cdk destroy

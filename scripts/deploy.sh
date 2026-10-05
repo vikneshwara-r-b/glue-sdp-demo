@@ -64,7 +64,7 @@ cdk deploy --profile "$AWS_PROFILE" --require-approval never "${CDK_EXTRA[@]+"${
 
 echo
 echo "Deployed. Stack outputs:"
-for k in BucketName Prefix DatabaseName JobName GlueJobRoleArn; do
+for k in BucketName Prefix DatabaseName JobName GlueJobRoleArn SilverDqRulesetName GoldDqRulesetName; do
   printf '  %-15s %s\n' "$k" "$(stack_output "$k")"
 done
 
