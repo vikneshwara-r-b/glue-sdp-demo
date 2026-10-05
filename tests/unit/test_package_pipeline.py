@@ -53,9 +53,11 @@ def test_render_package_manifest_carries_input_path(tmp_path):
     )
 
     # The input path reaches bronze through the manifest's `configuration:` block;
-    # the copied transformation file stays free of bucket/prefix values.
+    # the copied transformation file stays free of bucket/prefix values. It must be a
+    # directory, not a specific file: bronze_orders streams via spark.readStream, whose
+    # file source requires `.load(path)` to point at a directory it can monitor.
     manifest_text = (out_dir / "spark-pipeline.yml").read_text()
-    assert "orders.input.path: s3://my-bucket/my-prefix/input/orders.csv" in manifest_text
+    assert "orders.input.path: s3://my-bucket/my-prefix/input/" in manifest_text
     bronze_text = (out_dir / "transformations" / "01_bronze.py").read_text()
     assert "getResolvedOptions" not in bronze_text
     assert "my-bucket" not in bronze_text

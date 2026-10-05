@@ -38,12 +38,12 @@ Deployed with the [AWS CDK](https://aws.amazon.com/cdk/) (Python).
         └───────────────┬─────────────┘
                          │
         ┌────────────────▼────────────────┐
-        │  bronze_orders (materialized view)  │
+        │  bronze_orders (streaming table)    │
         │  raw CSV, every column as string    │
         └────────────────┬────────────────┘
                          │
         ┌────────────────▼────────────────┐
-        │  silver_orders (materialized view)  │
+        │  silver_orders (streaming table)    │
         │  typed, filtered to COMPLETE/amount>0 │
         │  + derived amount_band              │
         └────────────────┬────────────────┘
@@ -55,8 +55,11 @@ Deployed with the [AWS CDK](https://aws.amazon.com/cdk/) (Python).
 ```
 
 All three tables are produced by **one** Glue job (`orders-sdp-job`); SDP resolves the
-bronze → silver → gold ordering from `spark.table(...)` references in
-`pipeline_src/transformations/`, not from a hand-written DAG.
+bronze → silver → gold ordering from the table references in
+`pipeline_src/transformations/` (`spark.readStream.table("bronze_orders")`,
+`FROM silver_orders`), not from a hand-written DAG. `bronze_orders`/`silver_orders` are
+streaming tables (incremental, checkpointed in S3) and `gold_sales_summary` is a SQL
+materialized view (full recompute each run — it's an aggregation/report).
 
 ## Security
 
@@ -148,12 +151,11 @@ cdk synth
 cdk deploy
 ```
 
-`cdk deploy` prints `BucketName`, `DatabaseName`, `JobName`, and `GlueJobRoleArn` as
-stack outputs. Load them into shell variables for the steps below:
+`cdk deploy` prints `BucketName`, `Prefix`, `DatabaseName`, `JobName`, and
+`GlueJobRoleArn` as stack outputs. Load them into shell variables for the steps below:
 
 ```bash
 export AWS_REGION=<region>
-export PREFIX=orders-pipeline    # or your -c prefix override
 
 stack_output() {
   aws cloudformation describe-stacks --stack-name DeclarativeEtlPipelineUsingGlueStack \
@@ -161,32 +163,76 @@ stack_output() {
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
 }
 export BUCKET=$(stack_output BucketName)
+export PREFIX=$(stack_output Prefix)
 export JOB_NAME=$(stack_output JobName)
 export DATABASE=$(stack_output DatabaseName)
 ```
 
+Reading `PREFIX` from the `Prefix` output (instead of hardcoding `orders-pipeline`)
+means it always matches what was actually deployed, even if you overrode
+`-c prefix=...` for this run.
+
 ## Helper scripts (optional)
 
-Wrapper scripts in [`scripts/`](scripts/) run the same steps with a named AWS profile.
-Pass `--profile <your-aws-profile>` (or export `AWS_PROFILE`); the region comes from
-`--region`, `AWS_REGION`, or the profile's configured region.
+Wrapper scripts in [`scripts/`](scripts/) run the same steps with a named AWS profile,
+instead of the manual `cdk deploy` + `stack_output` + `aws s3 cp` sequence above.
 
-```bash
-scripts/deploy.sh      --profile <your-aws-profile> --bootstrap   # --bootstrap: first time only
-scripts/upload_data.sh --profile <your-aws-profile>               # uploads sample_data/orders.csv
-scripts/upload_data.sh --profile <your-aws-profile> a.csv b.csv   # or your own files
-scripts/destroy.sh     --profile <your-aws-profile>               # asks you to confirm the account ID
+### `scripts/deploy.sh`
+
+```
+scripts/deploy.sh --profile <your-aws-profile> [--region <region>] [--bootstrap] \
+  [--upload] [--prefix <prefix>] [file.csv ...] [-- <extra cdk args>]
 ```
 
-- `deploy.sh` runs `cdk deploy --require-approval never` (no IAM-change prompt) and prints
-  the stack outputs. Extra `cdk deploy` args go after `--`, e.g. `-- -c environment_tag=prod`.
-- `upload_data.sh` reads the bucket from the `BucketName` stack output and writes to
-  `<prefix>/input/` (`--prefix` defaults to `orders-pipeline`).
-- `destroy.sh` deletes the stack and every object in the bucket; `--yes` skips the prompt.
+| Flag | Meaning |
+|---|---|
+| `--profile <name>` | Required (or export `AWS_PROFILE`). AWS CLI/CDK profile to deploy with. |
+| `--region <region>` | Optional. Defaults to `AWS_REGION`, or the profile's configured region. |
+| `--bootstrap` | Runs `cdk bootstrap` first. Needed once per account/region — safe to pass on every run after that too, it's a no-op if already bootstrapped. |
+| `--upload` | After a successful deploy, also uploads file(s) to the deployed bucket's `<prefix>/input/`. Without this flag, no upload happens and any trailing file args below are simply unused. |
+| `--prefix <prefix>` | Only meaningful with `--upload`. Which `input/` prefix to upload into. Defaults to the just-deployed stack's own `Prefix` output — so it always matches what the pipeline actually reads from, even if you overrode `-c prefix=...` for this run. Pass `--prefix` explicitly only to upload somewhere *other* than where the pipeline reads. |
+| `[file.csv ...]` | Only meaningful with `--upload`. One or more local files to upload. With none given, uploads `sample_data/orders.csv`. |
+| `-- <extra cdk args>` | Everything after a literal `--` is forwarded to `cdk deploy` untouched, e.g. `-- -c environment_tag=prod`. Put this last — args after `--upload` but before `--` are still parsed as upload files, not cdk args. |
+
+What it does: runs `cdk deploy --require-approval never` (so it won't pause for an
+IAM-change prompt), prints the `BucketName`/`Prefix`/`DatabaseName`/`JobName`/
+`GlueJobRoleArn` stack outputs, then — only if `--upload` was passed — uploads your
+file(s) and prints the destination. Examples:
+
+```bash
+scripts/deploy.sh --profile <your-aws-profile> --bootstrap
+# ^ first deploy ever in this account/region
+
+scripts/deploy.sh --profile <your-aws-profile> --upload
+# ^ deploy + upload sample_data/orders.csv in one step
+
+scripts/deploy.sh --profile <your-aws-profile> --upload sample_data/orders_incremental.csv
+# ^ deploy + upload a specific file (e.g. to demo an incremental streaming-table run)
+
+scripts/deploy.sh --profile <your-aws-profile> --upload a.csv b.csv --prefix custom-prefix
+# ^ explicit --prefix overrides the stack's own Prefix output -- only needed to upload
+#   somewhere other than where the pipeline itself reads from
+
+scripts/deploy.sh --profile <your-aws-profile> -- -c environment_tag=prod -c num_workers=4
+# ^ deploy only, forwarding extra context overrides straight to `cdk deploy`
+
+scripts/deploy.sh --profile <your-aws-profile> --upload -- -c environment_tag=prod
+# ^ --upload and a `--` cdk passthrough can be combined
+```
+
+### `scripts/destroy.sh`
+
+```bash
+scripts/destroy.sh --profile <your-aws-profile>          # asks you to confirm the account ID
+scripts/destroy.sh --profile <your-aws-profile> --yes     # skips the confirmation prompt
+```
+
+Deletes the stack and every object in the bucket (see "Cleanup" below).
 
 ## Post-deploy: upload sample data
 
-Not part of the CDK stack — a manual step, run once per environment:
+Not part of the CDK stack — a one-time step per environment, done either via
+`scripts/deploy.sh --profile <your-aws-profile> --upload` (see above) or directly:
 
 ```bash
 aws s3 cp sample_data/orders.csv "s3://$BUCKET/$PREFIX/input/orders.csv" --region "$AWS_REGION"
@@ -203,6 +249,35 @@ aws glue start-job-run --job-name "$JOB_NAME" \
 aws glue start-job-run --job-name "$JOB_NAME" \
   --arguments '{"--conf":"spark.glue.sdp.jobMode=RUN"}' --region "$AWS_REGION"
 ```
+
+### Full refresh
+
+A full refresh (reset every table — including `bronze_orders`/`silver_orders`'s
+streaming-table checkpoints — and recompute everything from scratch) is a **runtime
+job argument**, not a CDK/infra change: no stack update, no deleting/recreating any
+deployed resource. `spark.glue.sdp.runMode` controls it, combined into the *same*
+`--conf` value as `jobMode` (space-separated, as one string — `--arguments` is a flat
+JSON map, so it can only hold a single `--conf` key; you can't pass two separate
+`--conf` entries):
+
+```bash
+# Full refresh: resets every table (including streaming-table checkpoints) and
+# recomputes everything from scratch.
+aws glue start-job-run --job-name "$JOB_NAME" \
+  --arguments '{"--conf":"spark.glue.sdp.jobMode=RUN --conf spark.glue.sdp.runMode=--full-refresh-all"}' \
+  --region "$AWS_REGION"
+
+# Full refresh of just one dataset (e.g. after fixing a bug in silver's logic,
+# without re-ingesting bronze from scratch):
+aws glue start-job-run --job-name "$JOB_NAME" \
+  --arguments '{"--conf":"spark.glue.sdp.jobMode=RUN --conf spark.glue.sdp.runMode=--full-refresh silver_orders"}' \
+  --region "$AWS_REGION"
+```
+
+`--full-refresh-all`/`--full-refresh <dataset>` reset streaming tables' checkpoints and
+reprocess all source data; for `gold_sales_summary` (a materialized view) it's a no-op
+beyond what a normal `RUN` already does, since materialized views always fully
+recompute anyway.
 
 ## Verify results
 

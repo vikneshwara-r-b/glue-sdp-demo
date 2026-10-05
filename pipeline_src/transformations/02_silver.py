@@ -7,11 +7,22 @@ from pyspark.sql import functions as F
 ORDER_TS_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'"
 
 
-@dp.materialized_view
-def silver_orders() -> DataFrame:
+# Streaming table: AWS Glue SDP's documented Python API for incremental tables is
+# dp.create_streaming_table() + @dp.append_flow(target=...), not a @dp.table decorator.
+# https://docs.aws.amazon.com/glue/latest/dg/spark-declarative-pipelines.html
+dp.create_streaming_table(
+    "silver_orders",
+    comment="Typed, filtered orders (COMPLETE status, positive amount) with a derived amount_band, processed incrementally from bronze_orders.",
+)
+
+
+@dp.append_flow(target="silver_orders")
+def ingest_silver_orders() -> DataFrame:
     # Glue's SDP wrapper doesn't inject a `spark` global into pipeline files.
     spark = SparkSession.active()
-    typed = spark.table("bronze_orders").select(
+    # readStream.table (not spark.table): bronze_orders must be read incrementally too,
+    # otherwise each run would reprocess bronze's entire history into silver.
+    typed = spark.readStream.table("bronze_orders").select(
         F.col("order_id"),
         F.col("customer_id"),
         F.col("region"),
@@ -36,4 +47,5 @@ def silver_orders() -> DataFrame:
         .when(F.col("amount") >= 100, "medium")
         .otherwise("small")
         .alias("amount_band"),
+        F.current_timestamp().alias("load_date_time"),
     )

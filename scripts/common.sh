@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for deploy.sh / upload_data.sh / destroy.sh. Source this, don't run it.
+# Shared helpers for deploy.sh / destroy.sh. Source this, don't run it.
 
 STACK_NAME="DeclarativeEtlPipelineUsingGlueStack"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

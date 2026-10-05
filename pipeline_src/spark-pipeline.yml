@@ -2,7 +2,7 @@ name: orders-declarative-pipeline
 database: {database}
 storage: s3://{bucket}/{prefix}/state/
 configuration:
-  orders.input.path: s3://{bucket}/{prefix}/input/orders.csv
+  orders.input.path: s3://{bucket}/{prefix}/input/
 libraries:
   - glob:
       include: transformations/**
