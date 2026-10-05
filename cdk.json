@@ -103,6 +103,16 @@
     "@aws-cdk/core:validateSnapshotRemovalPolicy": true,
     "@aws-cdk/custom-resources:logApiResponseDataPropertyTrueDefault": false,
     "@aws-cdk/customresources:installLatestAwsSdkDefault": false,
-    "@aws-cdk/s3-notifications:addS3TrustKeyPolicyForSnsSubscriptions": true
+    "@aws-cdk/s3-notifications:addS3TrustKeyPolicyForSnsSubscriptions": true,
+
+    "bucket_name": "glue-sdp-demo",
+    "bucket_suffix": "wminos",
+    "prefix": "orders-pipeline",
+    "database_name": "sdp_demo_db",
+    "job_name": "orders-sdp-job",
+    "worker_type": "G.1X",
+    "num_workers": "2",
+    "environment_tag": "dev",
+    "owner_tag": "de-team"
   }
 }

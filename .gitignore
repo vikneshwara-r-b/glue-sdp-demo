@@ -7,3 +7,12 @@ __pycache__
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Rendered pipeline package (regenerated at synth time by scripts/package_pipeline.py)
+build
+
+# Sample data
+sample_data
+
+# Local Claude Code settings (personal, not shared)
+.claude/settings.local.json

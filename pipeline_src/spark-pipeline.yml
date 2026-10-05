@@ -1,0 +1,8 @@
+name: orders-declarative-pipeline
+database: {database}
+storage: s3://{bucket}/{prefix}/state/
+configuration:
+  orders.input.path: s3://{bucket}/{prefix}/input/orders.csv
+libraries:
+  - glob:
+      include: transformations/**
