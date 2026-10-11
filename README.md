@@ -22,8 +22,7 @@ Deployed with the [AWS CDK](https://aws.amazon.com/cdk/) (Python).
   `aws_s3_assets.Asset`, not this bucket.)
 - **One AWS Glue 6.0 job** with Spark Declarative Pipelines enabled
   (`--enable-spark-declarative-pipeline`) and Data Catalog registration
-  (`--enable-glue-datacatalog`), running with the Flex execution class (cheaper spare
-  capacity; start time isn't guaranteed).
+  (`--enable-glue-datacatalog`).
 - **AWS Glue Data Catalog database** with an explicit `LocationUri` — SDP registers
   tables into it but does not create it, so CDK must.
 - **One IAM role** for Glue to assume, scoped to this bucket only (it also carries the
@@ -191,7 +190,7 @@ scripts/deploy.sh --profile <your-aws-profile> [--region <region>] [--bootstrap]
 | `--bootstrap` | Runs `cdk bootstrap` first. Needed once per account/region — safe to pass on every run after that too, it's a no-op if already bootstrapped. |
 | `--upload` | After a successful deploy, also uploads file(s) to the deployed bucket's `<prefix>/input/`. Without this flag, no upload happens and any trailing file args below are simply unused. |
 | `--prefix <prefix>` | Only meaningful with `--upload`. Which `input/` prefix to upload into. Defaults to the just-deployed stack's own `Prefix` output — so it always matches what the pipeline actually reads from, even if you overrode `-c prefix=...` for this run. Pass `--prefix` explicitly only to upload somewhere *other* than where the pipeline reads. |
-| `[file.csv ...]` | Only meaningful with `--upload`. One or more local files to upload. With none given, uploads `sample_data/orders.csv`. |
+| `[file.csv ...]` | Only meaningful with `--upload`. One or more files to upload. A bare filename (no `/`) is resolved against `sample_data/`, e.g. `orders_incremental.csv` → `sample_data/orders_incremental.csv`; a name containing `/` (relative or absolute) is used as-is instead. With none given, uploads `sample_data/orders.csv`. |
 | `-- <extra cdk args>` | Everything after a literal `--` is forwarded to `cdk deploy` untouched, e.g. `-- -c environment_tag=prod`. Put this last — args after `--upload` but before `--` are still parsed as upload files, not cdk args. |
 
 What it does: runs `cdk deploy --require-approval never` (so it won't pause for an
@@ -206,11 +205,13 @@ scripts/deploy.sh --profile <your-aws-profile> --bootstrap
 scripts/deploy.sh --profile <your-aws-profile> --upload
 # ^ deploy + upload sample_data/orders.csv in one step
 
-scripts/deploy.sh --profile <your-aws-profile> --upload sample_data/orders_incremental.csv
-# ^ deploy + upload a specific file (e.g. to demo an incremental streaming-table run)
+scripts/deploy.sh --profile <your-aws-profile> --upload orders_incremental.csv
+# ^ bare filename -> resolved against sample_data/ (e.g. to demo an incremental
+#   streaming-table run); same as passing sample_data/orders_incremental.csv explicitly
 
 scripts/deploy.sh --profile <your-aws-profile> --upload a.csv b.csv --prefix custom-prefix
-# ^ explicit --prefix overrides the stack's own Prefix output -- only needed to upload
+# ^ a.csv/b.csv are also bare filenames, so both resolve against sample_data/ too.
+#   explicit --prefix overrides the stack's own Prefix output -- only needed to upload
 #   somewhere other than where the pipeline itself reads from
 
 scripts/deploy.sh --profile <your-aws-profile> -- -c environment_tag=prod -c num_workers=4
@@ -218,6 +219,39 @@ scripts/deploy.sh --profile <your-aws-profile> -- -c environment_tag=prod -c num
 
 scripts/deploy.sh --profile <your-aws-profile> --upload -- -c environment_tag=prod
 # ^ --upload and a `--` cdk passthrough can be combined
+```
+
+### `scripts/run_job.sh`
+
+Triggers `start-job-run` on the deployed job with a chosen profile, instead of typing
+the `aws glue start-job-run --arguments '{"--conf":...}'` commands from "Run the
+pipeline"/"Full refresh" by hand. The job name is read from the stack's own `JobName`
+output.
+
+```
+scripts/run_job.sh --profile <your-aws-profile> [--region <region>] [MODE] [--wait]
+```
+
+| Mode flag | Equivalent `--conf` |
+|---|---|
+| *(none, default)* / `--run` | `spark.glue.sdp.jobMode=RUN` |
+| `--validate` | `spark.glue.sdp.jobMode=VALIDATE` (dry run, writes no data) |
+| `--full-refresh-all` | `jobMode=RUN` + `runMode=--full-refresh-all` |
+| `--full-refresh <dataset>` | `jobMode=RUN` + `runMode=--full-refresh <dataset>` |
+| `--refresh <dataset>` | `jobMode=RUN` + `runMode=--refresh <dataset>` |
+
+`--wait` polls the run every 10s and prints the final state (and the error message, on
+failure) instead of just printing the run ID and returning immediately.
+
+```bash
+scripts/run_job.sh --profile <your-aws-profile> --validate
+# ^ smoke test after a fresh deploy, before trusting a real RUN
+
+scripts/run_job.sh --profile <your-aws-profile> --wait
+# ^ run for real, block until it finishes (handy right after --upload)
+
+scripts/run_job.sh --profile <your-aws-profile> --full-refresh-all --wait
+scripts/run_job.sh --profile <your-aws-profile> --full-refresh silver_orders
 ```
 
 ### `scripts/destroy.sh`

@@ -7,11 +7,14 @@
 #
 # --bootstrap runs `cdk bootstrap` first (needed once per account/region).
 # --upload uploads file(s) to the deployed bucket's input/ prefix after a successful
-#   deploy. With no files given, uploads sample_data/orders.csv. Ignored without
-#   --upload. --prefix (also only meaningful with --upload) defaults to the stack's
-#   own Prefix output (so it always matches what was actually deployed, even if you
-#   overrode `-c prefix=...` for this run) -- pass --prefix explicitly only to upload
-#   somewhere other than where the pipeline itself reads from.
+#   deploy. With no files given, uploads sample_data/orders.csv. A bare filename (no
+#   "/") is resolved against sample_data/, e.g. `--upload orders_incremental.csv`
+#   uploads sample_data/orders_incremental.csv; a name containing "/" (relative or
+#   absolute) is used as-is instead. Ignored without --upload. --prefix (also only
+#   meaningful with --upload) defaults to the stack's own Prefix output (so it always
+#   matches what was actually deployed, even if you overrode `-c prefix=...` for this
+#   run) -- pass --prefix explicitly only to upload somewhere other than where the
+#   pipeline itself reads from.
 # Extra args after `--` go to `cdk deploy` untouched, e.g. -- -c environment_tag=prod
 set -euo pipefail
 # shellcheck source=scripts/common.sh
@@ -70,6 +73,18 @@ done
 
 if $UPLOAD; then
   [[ ${#FILES[@]} -gt 0 ]] || FILES=("$PROJECT_ROOT/sample_data/orders.csv")
+
+  # Resolve a bare filename (no path separator) against sample_data/; anything
+  # containing "/" is a path and is used as-is (relative to cwd, or absolute).
+  RESOLVED_FILES=()
+  for f in "${FILES[@]}"; do
+    if [[ "$f" == */* ]]; then
+      RESOLVED_FILES+=("$f")
+    else
+      RESOLVED_FILES+=("$PROJECT_ROOT/sample_data/$f")
+    fi
+  done
+  FILES=("${RESOLVED_FILES[@]}")
 
   BUCKET="$(stack_output BucketName)"
   if [[ -z "$BUCKET" || "$BUCKET" == "None" ]]; then
