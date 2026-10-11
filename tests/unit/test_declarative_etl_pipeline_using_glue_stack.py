@@ -132,7 +132,6 @@ def test_glue_job_uses_version_6_and_sdp_flags():
             "GlueVersion": "6.0",
             "WorkerType": "G.1X",
             "NumberOfWorkers": 2,
-            "ExecutionClass": "FLEX",
             "DefaultArguments": {
                 "--enable-spark-declarative-pipeline": "true",
                 "--enable-glue-datacatalog": "true",
